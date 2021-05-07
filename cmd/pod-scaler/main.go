@@ -4,9 +4,12 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"net/url"
 	"os"
+	"strings"
 
 	"cloud.google.com/go/storage"
+	"github.com/jackc/pgx/v4/pgxpool"
 	prometheusclient "github.com/prometheus/client_golang/api"
 	prometheusapi "github.com/prometheus/client_golang/api/prometheus/v1"
 	"github.com/sirupsen/logrus"
@@ -38,6 +41,11 @@ type options struct {
 	loglevel string
 
 	cacheDir           string
+	sqlHost            string
+	sqlUser            string
+	sqlCACertFile      string
+	sqlClientCertFile  string
+	sqlClientKeyFile   string
 	cacheBucket        string
 	gcsCredentialsFile string
 }
@@ -65,6 +73,11 @@ func bindOptions(fs *flag.FlagSet) *options {
 	fs.StringVar(&o.cacheDir, "cache-dir", "", "Local directory holding cache data (for development mode).")
 	fs.StringVar(&o.cacheBucket, "cache-bucket", "", "GCS bucket name holding cached Prometheus data.")
 	fs.StringVar(&o.gcsCredentialsFile, "gcs-credentials-file", "", "File where GCS credentials are stored.")
+	fs.StringVar(&o.sqlHost, "sql-endpoint", "", "Host for the SQL database.")
+	fs.StringVar(&o.sqlUser, "sql-user", "", "User for the SQL database.")
+	fs.StringVar(&o.sqlCACertFile, "sql-ca-cert", "", "File holding the CA cert to connect to the SQL server.")
+	fs.StringVar(&o.sqlClientCertFile, "sql-client-cert", "", "File holding the client cert to connect to the SQL server.")
+	fs.StringVar(&o.sqlClientKeyFile, "sql-client-key", "", "File holding the client key to connect to the SQL server.")
 	return &o
 }
 
@@ -97,6 +110,17 @@ func (o *options) validate() error {
 			return errors.New("--gcs-credentials-file is required")
 		}
 	}
+	for key, val := range map[string]string{
+		"sql-endpoint":    o.sqlHost,
+		"sql-user":        o.sqlUser,
+		"sql-ca-cert":     o.sqlCACertFile,
+		"sql-client-cert": o.sqlClientCertFile,
+		"sql-client-key":  o.sqlClientKeyFile,
+	} {
+		if val == "" {
+			return fmt.Errorf("--%s is required", key)
+		}
+	}
 	if level, err := logrus.ParseLevel(o.loglevel); err != nil {
 		return fmt.Errorf("--loglevel invalid: %w", err)
 	} else {
@@ -119,6 +143,39 @@ func main() {
 	}
 
 	pprofutil.Instrument(opts.instrumentationOptions)
+
+	u, err := url.Parse(opts.sqlHost)
+	if err != nil {
+		logrus.WithError(err).Fatal("Could not parse SQL server URL.")
+	}
+
+	connParameters := map[string]string{
+		"host":        u.Hostname(),
+		"port":        u.Port(),
+		"user":        opts.sqlUser,
+		"sslmode":     "verify-full",
+		"sslcert":     opts.sqlClientCertFile,
+		"sslkey":      opts.sqlClientKeyFile,
+		"sslrootcert": opts.sqlCACertFile,
+	}
+	var connParameterPairs []string
+	for key, value := range connParameters {
+		connParameterPairs = append(connParameterPairs, fmt.Sprintf("%s=%s", key, value))
+	}
+	connConfig, err := pgxpool.ParseConfig(strings.Join(connParameterPairs, " "))
+	if err != nil {
+		logrus.WithError(err).Fatal("Could not create SQL client connection config.")
+	}
+
+	pool, err := pgxpool.ConnectConfig(interrupts.Context(), connConfig)
+	if err != nil {
+		logrus.WithError(err).Fatal("Could not create SQL client.")
+	}
+
+	if err := pool.Ping(interrupts.Context()); err != nil {
+		logrus.WithError(err).Fatal("Could not ping SQL server.")
+	}
+	os.Exit(0)
 
 	var cache cache
 	if opts.cacheDir != "" {

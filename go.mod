@@ -33,6 +33,7 @@ require (
 	github.com/hashicorp/go-version v1.2.1
 	github.com/hashicorp/vault/api v1.0.4
 	github.com/hashicorp/vault/sdk v0.1.13
+	github.com/jackc/pgx/v4 v4.11.0
 	github.com/julienschmidt/httprouter v1.3.0
 	github.com/kataras/tablewriter v0.0.0-20180708051242-e063d29b7c23
 	github.com/mattn/go-zglob v0.0.2
@@ -61,6 +62,7 @@ require (
 	gopkg.in/robfig/cron.v2 v2.0.0-20150107220207-be2e0b0deed5
 	k8s.io/api v0.21.0
 	k8s.io/apimachinery v0.21.0
+	k8s.io/apiserver v0.21.0
 	k8s.io/client-go v11.0.1-0.20190805182717-6502b5e7b1b5+incompatible
 	k8s.io/klog/v2 v2.8.0
 	k8s.io/test-infra v0.0.0-20210504134511-af1ac03335dc
