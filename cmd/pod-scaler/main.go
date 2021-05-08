@@ -1,31 +1,35 @@
 package main
 
 import (
+	_ "embed"
 	"errors"
 	"flag"
 	"fmt"
 	"net/url"
 	"os"
-	"strings"
+	"time"
 
 	"cloud.google.com/go/storage"
+	"github.com/jackc/pgx/v4/log/logrusadapter"
 	"github.com/jackc/pgx/v4/pgxpool"
+	"github.com/openshift/ci-tools/pkg/psql"
 	prometheusclient "github.com/prometheus/client_golang/api"
 	prometheusapi "github.com/prometheus/client_golang/api/prometheus/v1"
 	"github.com/sirupsen/logrus"
 	"google.golang.org/api/option"
 	"gopkg.in/fsnotify.v1"
-	"k8s.io/test-infra/prow/logrusutil"
-	"k8s.io/test-infra/prow/version"
 
-	buildclientset "github.com/openshift/client-go/build/clientset/versioned/typed/build/v1"
-	routeclientset "github.com/openshift/client-go/route/clientset/versioned/typed/route/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/transport"
 	prowflagutil "k8s.io/test-infra/prow/flagutil"
 	"k8s.io/test-infra/prow/interrupts"
+	"k8s.io/test-infra/prow/logrusutil"
 	pprofutil "k8s.io/test-infra/prow/pjutil/pprof"
+	"k8s.io/test-infra/prow/version"
+
+	buildclientset "github.com/openshift/client-go/build/clientset/versioned/typed/build/v1"
+	routeclientset "github.com/openshift/client-go/route/clientset/versioned/typed/route/v1"
 
 	"github.com/openshift/ci-tools/pkg/util"
 )
@@ -140,6 +144,11 @@ func (o *options) validate() error {
 	return o.instrumentationOptions.Validate(false)
 }
 
+var (
+	//go:embed init.sql
+	initSQL string
+)
+
 func main() {
 	flagSet := flag.NewFlagSet("", flag.ExitOnError)
 	opts := bindOptions(flagSet)
@@ -153,7 +162,12 @@ func main() {
 	case logStyleJson:
 		logrusutil.ComponentInit()
 	case logStyleText:
-		// default settings are ok
+		logrus.SetFormatter(&logrus.TextFormatter{
+			ForceColors:     true,
+			DisableQuote:    true,
+			FullTimestamp:   true,
+			TimestampFormat: time.RFC3339,
+		})
 	}
 	logrus.Infof("%s version %s", version.Name, version.Version)
 
@@ -164,23 +178,17 @@ func main() {
 		logrus.WithError(err).Fatal("Could not parse SQL server URL.")
 	}
 
-	connParameters := map[string]string{
-		"host":        u.Hostname(),
-		"port":        u.Port(),
-		"user":        opts.sqlUser,
-		"sslmode":     "verify-full",
-		"sslcert":     opts.sqlClientCertFile,
-		"sslkey":      opts.sqlClientKeyFile,
-		"sslrootcert": opts.sqlCACertFile,
-	}
-	var connParameterPairs []string
-	for key, value := range connParameters {
-		connParameterPairs = append(connParameterPairs, fmt.Sprintf("%s=%s", key, value))
-	}
-	connConfig, err := pgxpool.ParseConfig(strings.Join(connParameterPairs, " "))
+	connConfig, err := pgxpool.ParseConfig(psql.ConnectionConfig{
+		URL:            u,
+		User:           opts.sqlUser,
+		ClientCertFile: opts.sqlClientCertFile,
+		ClientKeyFile:  opts.sqlClientKeyFile,
+		RootCAFile:     opts.sqlCACertFile,
+	}.Config())
 	if err != nil {
 		logrus.WithError(err).Fatal("Could not create SQL client connection config.")
 	}
+	connConfig.ConnConfig.Logger = logrusadapter.NewLogger(logrus.WithField("client", "postgres"))
 
 	pool, err := pgxpool.ConnectConfig(interrupts.Context(), connConfig)
 	if err != nil {
@@ -190,7 +198,6 @@ func main() {
 	if err := pool.Ping(interrupts.Context()); err != nil {
 		logrus.WithError(err).Fatal("Could not ping SQL server.")
 	}
-	os.Exit(0)
 
 	var cache cache
 	if opts.cacheDir != "" {
@@ -206,7 +213,7 @@ func main() {
 
 	switch opts.mode {
 	case "producer":
-		mainProduce(opts, cache)
+		mainProduce(opts, cache, pool)
 	case "consumer.ui":
 		// TODO
 	case "consumer.admission":
@@ -215,7 +222,12 @@ func main() {
 	interrupts.WaitForGracefulShutdown()
 }
 
-func mainProduce(opts *options, cache cache) {
+func mainProduce(opts *options, cache cache, sqlClient *pgxpool.Pool) {
+	out, err := sqlClient.Exec(interrupts.Context(), initSQL)
+	if err != nil {
+		logrus.WithError(err).Fatalf("Could not initialize SQL database: %v.", string(out))
+	}
+
 	kubeconfigChangedCallBack := func(e fsnotify.Event) {
 		logrus.WithField("event", e.String()).Fatal("Kubeconfig changed, exiting to get restarted by Kubelet and pick up the changes")
 	}
@@ -247,7 +259,7 @@ func mainProduce(opts *options, cache cache) {
 		logger.Debugf("Loaded Prometheus client.")
 	}
 
-	go produce(clients, cache)
+	go produce(clients, cache, sqlClient)
 }
 
 func mainAdmission(opts *options) {

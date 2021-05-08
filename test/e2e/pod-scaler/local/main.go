@@ -7,11 +7,13 @@ package main
 import (
 	"fmt"
 	"io/ioutil"
+	"net/url"
 	"os"
 	"os/exec"
 	"path"
 	"time"
 
+	"github.com/openshift/ci-tools/pkg/psql"
 	"github.com/sirupsen/logrus"
 
 	"k8s.io/apimachinery/pkg/util/sets"
@@ -25,7 +27,7 @@ import (
 
 func main() {
 	logger := logrus.WithField("component", "local-pod-scaler")
-	tmpDir, err := ioutil.TempDir("", "")
+	tmpDir, err := ioutil.TempDir("", "podscaler")
 	if err != nil {
 		logger.WithError(err).Fatal("Failed to create temporary directory.")
 	}
@@ -45,7 +47,7 @@ func main() {
 	if err := os.Chmod(postgresDir, 0777); err != nil {
 		logger.WithError(err).Fatal("Failed to open permissions in temporary directory for Postgres.")
 	}
-	logger.Info("Postgres data will be in %")
+	logger.Infof("Postgres data will be in %s", postgresDir)
 	postgresUser := "postgres"
 	cmd := exec.Command("pg_ctl", "init",
 		"-D", postgresDir,
@@ -72,9 +74,9 @@ func main() {
 	caCertFile := path.Join(authDir, "ca.crt")
 	caKeyFile := path.Join(authDir, "ca.key")
 	caSerialFile := path.Join(authDir, "ca.serial")
-	ca, err := crypto.MakeSelfSignedCA(caCertFile, caKeyFile, caSerialFile, postgresUser, 10)
+	ca, err := crypto.MakeSelfSignedCA(caCertFile, caKeyFile, caSerialFile, "selfca", 10)
 	if err != nil {
-		logger.WithError(err).Fatal("Failed to generate cert and key for postgres auth.")
+		logger.WithError(err).Fatal("Failed to generate self-signed CA for postgres auth.")
 	}
 	serverHostname := "127.0.0.1"
 	serverCertFile := path.Join(authDir, "server.crt")
@@ -96,7 +98,7 @@ func main() {
 		logger.Infof("Postgres starting on port %s", port)
 		return []string{"-c", fmt.Sprintf("port=%s", port)}
 	}, func(port, _ string) []string {
-		return []string{"--sql-endpoint", fmt.Sprintf("%s:%s", serverHostname, port)}
+		return []string{"--sql-endpoint", fmt.Sprintf("postgres://%s:%s", serverHostname, port)}
 	})
 	postgres.RunFromFrameworkRunner(t, interrupts.Context())
 	// TODO: ping for ready
@@ -111,10 +113,24 @@ func main() {
 	}
 
 	connectionFlags := postgres.ClientFlags()
+	// this is a hack, but whatever
+	u, err := url.Parse(connectionFlags[1])
+	if err != nil {
+		logrus.WithError(err).Fatal("Could not parse postgres URL.")
+	}
+	connConfig := psql.ConnectionConfig{
+		URL:            u,
+		User:           postgresUser,
+		ClientCertFile: clientCertFile,
+		ClientKeyFile:  clientKeyFile,
+		RootCAFile:     caCertFile,
+	}
+	logrus.Infof("Connect with `psql \"%s\"`", connConfig.Config())
 	podScalerFlags := []string{
 		"--kubeconfig=/tmp/kubeconfig",
 		"--loglevel=debug",
-		"--cache-dir=~/cache",
+		"--log-style=text",
+		"--cache-dir=/home/stevekuznetsov/cache",
 		"--mode=producer",
 		"--sql-user", postgresUser,
 		"--sql-ca-cert", caCertFile,
@@ -122,12 +138,14 @@ func main() {
 		"--sql-client-key", clientKeyFile,
 	}
 	podScalerFlags = append(podScalerFlags, connectionFlags...)
-	podScaler := exec.Command("pod-scaler", podScalerFlags...)
-	out, err = podScaler.CombinedOutput()
-	if err != nil {
-		logrus.WithError(err).Fatalf("Failed to run pod-scaler: %v", string(out))
+	logger.Infof("Running pod-scaler %v", podScalerFlags)
+	podScaler := exec.CommandContext(interrupts.Context(), "pod-scaler", podScalerFlags...)
+	podScaler.Stdout = os.Stdout
+	podScaler.Stderr = os.Stderr
+
+	if err := podScaler.Run(); err != nil {
+		logrus.WithError(err).Fatal("Failed to run pod-scaler.")
 	}
-	logrus.Infof("Ran pod-scaler: %v", string(out))
 	interrupts.WaitForGracefulShutdown()
 }
 
@@ -138,7 +156,7 @@ type fakeT struct {
 
 var _ testhelper.TestingTInterface = &fakeT{}
 
-func (t *fakeT) Cleanup(f func())                          {}
+func (t *fakeT) Cleanup(f func())                          { logrus.RegisterExitHandler(f) }
 func (t *fakeT) Deadline() (deadline time.Time, ok bool)   { return time.Time{}, false }
 func (t *fakeT) Error(args ...interface{})                 { t.logger.Error(args...) }
 func (t *fakeT) Errorf(format string, args ...interface{}) { t.logger.Errorf(format, args...) }

@@ -5,11 +5,13 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 
 	"cloud.google.com/go/storage"
+	"github.com/jackc/pgx/v4/pgxpool"
 	"github.com/openhistogram/circonusllhist"
 	prometheusapi "github.com/prometheus/client_golang/api/prometheus/v1"
 	"github.com/prometheus/common/model"
@@ -71,7 +73,7 @@ func queriesByMetric() map[string]string {
 	return queries
 }
 
-func produce(clients map[string]prometheusapi.API, dataCache cache) {
+func produce(clients map[string]prometheusapi.API, dataCache cache, sqlClient *pgxpool.Pool) {
 	interrupts.TickLiteral(func() {
 		for name, query := range queriesByMetric() {
 			name := name
@@ -89,47 +91,113 @@ func produce(clients map[string]prometheusapi.API, dataCache cache) {
 					Data:            map[model.Fingerprint]*circonusllhist.Histogram{},
 					DataByMetaData:  map[FullMetadata][]model.Fingerprint{},
 				}
+			} else if err != nil {
+				logrus.WithError(err).Fatal("Could not load data from storage.")
 			}
-			now := time.Now()
-			q := querier{
-				lock: &sync.RWMutex{},
-				data: cache,
+			//now := time.Now()
+			//q := querier{
+			//	lock: &sync.RWMutex{},
+			//	data: cache,
+			//}
+			//wg := &sync.WaitGroup{}
+			//for clusterName, client := range clients {
+			//	metadata := &clusterMetadata{
+			//		logger: logger.WithField("cluster", clusterName),
+			//		name:   clusterName,
+			//		client: client,
+			//		lock:   &sync.RWMutex{},
+			//		// there's absolutely no chance Prometheus at the current scaling will ever be able
+			//		// to respond to large requests it's completely capable of creating, so don't even
+			//		// bother asking for anything larger than 1/20th of the largest request we can get
+			//		// responses within the default client connection timeout.
+			//		maxSize: MaxSamplesPerRequest / 20,
+			//		errors:  make(chan error),
+			//		// there's also no chance that Prometheus will be able to handle any real concurrent
+			//		// request volume, so don't even bother trying to request more samples at once than
+			//		// a fifth of the maximum samples it can technically provide in one request
+			//		sync: semaphore.NewWeighted(MaxSamplesPerRequest / 15),
+			//		wg:   &sync.WaitGroup{},
+			//	}
+			//	wg.Add(1)
+			//	go func() {
+			//		defer wg.Done()
+			//		if err := q.execute(interrupts.Context(), metadata, now); err != nil {
+			//			metadata.logger.WithError(err).Error("Failed to query Prometheus.")
+			//		}
+			//	}()
+			//}
+			//go func() { // don't associate this with the context as we want to flush when interrupted
+			//	wg.Wait()
+			//	if err := storeCache(dataCache, name, cache, logger); err != nil {
+			//		logger.WithError(err).Error("Failed to write cached data.")
+			//	}
+			//}()
+			if err := storeData(name, query, cache, logger, sqlClient); err != nil {
+				logger.WithError(err).Error("Failed to write cached data to SQL.")
 			}
-			wg := &sync.WaitGroup{}
-			for clusterName, client := range clients {
-				metadata := &clusterMetadata{
-					logger: logger.WithField("cluster", clusterName),
-					name:   clusterName,
-					client: client,
-					lock:   &sync.RWMutex{},
-					// there's absolutely no chance Prometheus at the current scaling will ever be able
-					// to respond to large requests it's completely capable of creating, so don't even
-					// bother asking for anything larger than 1/20th of the largest request we can get
-					// responses within the default client connection timeout.
-					maxSize: MaxSamplesPerRequest / 20,
-					errors:  make(chan error),
-					// there's also no chance that Prometheus will be able to handle any real concurrent
-					// request volume, so don't even bother trying to request more samples at once than
-					// a fifth of the maximum samples it can technically provide in one request
-					sync: semaphore.NewWeighted(MaxSamplesPerRequest / 15),
-					wg:   &sync.WaitGroup{},
-				}
-				wg.Add(1)
-				go func() {
-					defer wg.Done()
-					if err := q.execute(interrupts.Context(), metadata, now); err != nil {
-						metadata.logger.WithError(err).Error("Failed to query Prometheus.")
-					}
-				}()
-			}
-			go func() { // don't associate this with the context as we want to flush when interrupted
-				wg.Wait()
-				if err := storeCache(dataCache, name, cache, logger); err != nil {
-					logger.WithError(err).Error("Failed to write cached data.")
-				}
-			}()
 		}
 	}, 3*time.Hour)
+}
+
+// upsertReturningId creates a query for cases where we want to insert a new row or use a previous one,
+// in an atomic manner. Postgres does not allow `INSERT ... ON CONFLICT DO NOTHING RETURNING ...` to work,
+// so we need this monstrosity in order to be performant, as we expect most of these calls to be duplicates
+// of what's already in the DB: https://stackoverflow.com/a/42217872
+func upsertReturningId(table string, columns ...string) string {
+	delimitedColumns := strings.Join(columns, ", ")
+	var parameters []string
+	for i := range columns {
+		parameters = append(parameters, fmt.Sprintf("$%d", i+1))
+	}
+	delimitedParameters := strings.Join(parameters, ", ")
+	return fmt.Sprintf(`WITH input_rows(%[1]s) AS (
+    (SELECT %[1]s FROM %[2]s LIMIT 0)
+    UNION ALL
+    VALUES (%[3]s)
+), inserted_rows AS (INSERT INTO %[2]s(%[1]s)
+    SELECT * FROM input_rows
+    ON CONFLICT DO NOTHING
+    RETURNING id
+)
+SELECT id FROM inserted_rows
+UNION ALL
+SELECT c.id FROM input_rows JOIN %[2]s c USING(%[1]s)`, delimitedColumns, table, delimitedParameters)
+}
+
+func storeData(name, query string, cache *CachedQuery, logger *logrus.Entry, client *pgxpool.Pool) error {
+	for cluster, ranges := range cache.RangesByCluster {
+		logger.Infof("Saving %s:%s", name, cluster)
+		var queryId int64
+		if err := client.QueryRow(interrupts.Context(), upsertReturningId("poscaler.queries", "cluster", "query"), cluster, query).Scan(&queryId); err != nil {
+			return fmt.Errorf("could not get query identifier: %v", err)
+		}
+
+		if out, err := client.Exec(interrupts.Context(), `DELETE FROM podscaler.ranges WHERE id=$1`, queryId); err != nil {
+			return fmt.Errorf("could not remove old ranges: %v: %s", err, string(out))
+		}
+		for _, r := range ranges {
+			if out, err := client.Exec(interrupts.Context(), `INSERT INTO podscaler.ranges(id, query_start, query_end) VALUES($1, $2, $3)`, queryId, r.Start, r.End); err != nil {
+				return fmt.Errorf("could not record range: %v: %s", err, string(out))
+			}
+		}
+	}
+	parts := strings.SplitN(name, "/", 2)
+	prefix, metric := parts[0], parts[1]
+	for meta, identifiers := range cache.DataByMetaData {
+		var confId int64
+		if err := client.QueryRow(interrupts.Context(), upsertReturningId("poscaler.conf", "org", "repo", "branch", "variant"), meta.Org, meta.Repo, meta.Branch, meta.Variant).Scan(&confId); err != nil {
+			return fmt.Errorf("could not get configuration identifier: %v", err)
+		}
+		switch prefix {
+		case "pods":
+
+		case "steps":
+
+		case "prowjobs":
+			// sdf
+		}
+	}
+	return nil
 }
 
 // queryFor applies our filtering and left joins to a metric to get data we can use
