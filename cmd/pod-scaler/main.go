@@ -15,18 +15,17 @@ import (
 	"github.com/sirupsen/logrus"
 	"google.golang.org/api/option"
 	"gopkg.in/fsnotify.v1"
+	"k8s.io/test-infra/prow/logrusutil"
+	"k8s.io/test-infra/prow/version"
 
+	buildclientset "github.com/openshift/client-go/build/clientset/versioned/typed/build/v1"
+	routeclientset "github.com/openshift/client-go/route/clientset/versioned/typed/route/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/transport"
 	prowflagutil "k8s.io/test-infra/prow/flagutil"
 	"k8s.io/test-infra/prow/interrupts"
-	"k8s.io/test-infra/prow/logrusutil"
 	pprofutil "k8s.io/test-infra/prow/pjutil/pprof"
-	"k8s.io/test-infra/prow/version"
-
-	buildclientset "github.com/openshift/client-go/build/clientset/versioned/typed/build/v1"
-	routeclientset "github.com/openshift/client-go/route/clientset/versioned/typed/route/v1"
 
 	"github.com/openshift/ci-tools/pkg/util"
 )
@@ -39,6 +38,7 @@ type options struct {
 	instrumentationOptions prowflagutil.InstrumentationOptions
 
 	loglevel string
+	logStyle string
 
 	cacheDir           string
 	sqlHost            string
@@ -70,6 +70,7 @@ func bindOptions(fs *flag.FlagSet) *options {
 	fs.IntVar(&o.uiPort, "ui-port", 0, "Port to serve frontend on.")
 	fs.StringVar(&o.certDir, "serving-cert-dir", "", "Path to directory with serving certificate and key for the admission webhook server.")
 	fs.StringVar(&o.loglevel, "loglevel", "debug", "Logging level.")
+	fs.StringVar(&o.logStyle, "log-style", "json", "Logging style: json or text.")
 	fs.StringVar(&o.cacheDir, "cache-dir", "", "Local directory holding cache data (for development mode).")
 	fs.StringVar(&o.cacheBucket, "cache-bucket", "", "GCS bucket name holding cached Prometheus data.")
 	fs.StringVar(&o.gcsCredentialsFile, "gcs-credentials-file", "", "File where GCS credentials are stored.")
@@ -80,6 +81,11 @@ func bindOptions(fs *flag.FlagSet) *options {
 	fs.StringVar(&o.sqlClientKeyFile, "sql-client-key", "", "File holding the client key to connect to the SQL server.")
 	return &o
 }
+
+const (
+	logStyleJson = "json"
+	logStyleText = "text"
+)
 
 func (o *options) validate() error {
 	switch o.mode {
@@ -121,6 +127,10 @@ func (o *options) validate() error {
 			return fmt.Errorf("--%s is required", key)
 		}
 	}
+
+	if o.logStyle != logStyleJson && o.logStyle != logStyleText {
+		return fmt.Errorf("--log-style must be one of %s or %s, not %s", logStyleText, logStyleJson, o.logStyle)
+	}
 	if level, err := logrus.ParseLevel(o.loglevel); err != nil {
 		return fmt.Errorf("--loglevel invalid: %w", err)
 	} else {
@@ -131,8 +141,6 @@ func (o *options) validate() error {
 }
 
 func main() {
-	logrusutil.ComponentInit()
-	logrus.Infof("%s version %s", version.Name, version.Version)
 	flagSet := flag.NewFlagSet("", flag.ExitOnError)
 	opts := bindOptions(flagSet)
 	if err := flagSet.Parse(os.Args[1:]); err != nil {
@@ -141,6 +149,13 @@ func main() {
 	if err := opts.validate(); err != nil {
 		logrus.WithError(err).Fatal("Failed to validate flags")
 	}
+	switch opts.logStyle {
+	case logStyleJson:
+		logrusutil.ComponentInit()
+	case logStyleText:
+		// default settings are ok
+	}
+	logrus.Infof("%s version %s", version.Name, version.Version)
 
 	pprofutil.Instrument(opts.instrumentationOptions)
 
