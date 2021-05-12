@@ -13,7 +13,6 @@ import (
 	"path"
 	"time"
 
-	"github.com/openshift/ci-tools/pkg/psql"
 	"github.com/sirupsen/logrus"
 
 	"k8s.io/apimachinery/pkg/util/sets"
@@ -22,6 +21,7 @@ import (
 
 	"github.com/openshift/library-go/pkg/crypto"
 
+	"github.com/openshift/ci-tools/pkg/psql"
 	"github.com/openshift/ci-tools/pkg/testhelper"
 )
 

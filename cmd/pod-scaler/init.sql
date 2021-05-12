@@ -97,3 +97,10 @@ CREATE TABLE IF NOT EXISTS podscaler.histograms
     metric    TEXT NOT NULL,
     histogram BYTEA NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS podscaler.requests
+(
+    id        UUID NOT NULL PRIMARY KEY,
+    resource  TEXT NOT NULL,
+    value     DOUBLE PRECISION NOT NULL
+);
