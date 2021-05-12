@@ -1,10 +1,12 @@
+CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
+
 CREATE SCHEMA IF NOT EXISTS podscaler;
 
 CREATE TABLE IF NOT EXISTS podscaler.queries
 (
     id      SERIAL PRIMARY KEY,
-    cluster VARCHAR(256) NOT NULL,
-    query   VARCHAR(2048) NOT NULL,
+    cluster TEXT NOT NULL,
+    query   TEXT NOT NULL,
     UNIQUE (cluster, query)
 );
 
@@ -16,81 +18,82 @@ CREATE TABLE IF NOT EXISTS podscaler.ranges
     query_end   TIMESTAMP NOT NULL
 );
 
-CREATE TABLE IF NOT EXISTS podscaler.meta
-(
-    id  SERIAL PRIMARY KEY
-);
-
 CREATE TABLE IF NOT EXISTS podscaler.conf
 (
     id      SERIAL PRIMARY KEY,
-    org     VARCHAR(256) NOT NULL,
-    repo    VARCHAR(256) NOT NULL,
-    branch  VARCHAR(256) NOT NULL,
-    variant VARCHAR(256),
+    org     TEXT NOT NULL,
+    repo    TEXT NOT NULL,
+    branch  TEXT NOT NULL,
+    variant TEXT,
     UNIQUE (org, repo, branch, variant)
 );
 
 CREATE TABLE IF NOT EXISTS podscaler.steps
 (
-    meta_id   INTEGER NOT NULL PRIMARY KEY,
-    CONSTRAINT meta_id_constraint FOREIGN KEY (meta_id) REFERENCES podscaler.meta (id),
-    conf_id   INTEGER NOT NULL,
-    FOREIGN KEY (conf_id) REFERENCES podscaler.conf (id),
-    target    VARCHAR(256) NOT NULL,
-    step      VARCHAR(256) NOT NULL,
-    container VARCHAR(256) NOT NULL,
-    UNIQUE (meta_id, conf_id, target, step, container)
+    id        UUID NOT NULL DEFAULT uuid_generate_v4() PRIMARY KEY,
+    conf_id   INTEGER NOT NULL REFERENCES podscaler.conf (id),
+    target    TEXT NOT NULL,
+    step      TEXT NOT NULL,
+    container TEXT NOT NULL,
+    UNIQUE (conf_id, target, step, container)
+);
+
+CREATE TABLE IF NOT EXISTS podscaler.pods
+(
+    id        UUID NOT NULL DEFAULT uuid_generate_v4() PRIMARY KEY,
+    conf_id   INTEGER NOT NULL REFERENCES podscaler.conf (id),
+    target    TEXT NOT NULL,
+    container TEXT NOT NULL,
+    UNIQUE (conf_id, target, container)
 );
 
 CREATE TABLE IF NOT EXISTS podscaler.builds
 (
-    meta_id   INTEGER NOT NULL PRIMARY KEY,
-    CONSTRAINT meta_id_constraint FOREIGN KEY (meta_id) REFERENCES podscaler.meta (id),
-    conf_id   INTEGER NOT NULL,
-    FOREIGN KEY (conf_id) REFERENCES podscaler.conf (id),
-    build     VARCHAR(256) NOT NULL,
-    container VARCHAR(256) NOT NULL,
-    UNIQUE (meta_id, conf_id, build, container)
+    id        UUID NOT NULL DEFAULT uuid_generate_v4() PRIMARY KEY,
+    conf_id   INTEGER NOT NULL REFERENCES podscaler.conf (id),
+    build     TEXT NOT NULL,
+    container TEXT NOT NULL,
+    UNIQUE (conf_id, build, container)
 );
 
 CREATE TABLE IF NOT EXISTS podscaler.releases
 (
-    meta_id   INTEGER NOT NULL PRIMARY KEY,
-    CONSTRAINT meta_id_constraint FOREIGN KEY (meta_id) REFERENCES podscaler.meta (id),
-    conf_id   INTEGER NOT NULL,
-    FOREIGN KEY (conf_id) REFERENCES podscaler.conf (id),
-    pod       VARCHAR(256) NOT NULL,
-    container VARCHAR(256) NOT NULL,
-    UNIQUE (meta_id, conf_id, pod, container)
+    id        UUID NOT NULL DEFAULT uuid_generate_v4() PRIMARY KEY,
+    conf_id   INTEGER NOT NULL REFERENCES podscaler.conf (id),
+    pod       TEXT NOT NULL,
+    container TEXT NOT NULL,
+    UNIQUE (conf_id, pod, container)
 );
 
 CREATE TABLE IF NOT EXISTS podscaler.rpms
 (
-    meta_id INTEGER NOT NULL PRIMARY KEY,
-    CONSTRAINT meta_id_constraint FOREIGN KEY (meta_id) REFERENCES podscaler.meta (id),
-    conf_id INTEGER NOT NULL,
-    FOREIGN KEY (conf_id) REFERENCES podscaler.conf (id),
-    UNIQUE (meta_id, conf_id)
+    id      UUID NOT NULL DEFAULT uuid_generate_v4() PRIMARY KEY,
+    conf_id INTEGER NOT NULL REFERENCES podscaler.conf (id),
+    UNIQUE (conf_id)
 );
 
 CREATE TABLE IF NOT EXISTS podscaler.prowjobs
 (
-    meta_id   INTEGER NOT NULL PRIMARY KEY,
-    CONSTRAINT meta_id_constraint FOREIGN KEY (meta_id) REFERENCES podscaler.meta (id),
-    conf_id   INTEGER,
-    FOREIGN KEY (conf_id) REFERENCES podscaler.conf (id),
-    context   VARCHAR(256) NOT NULL,
-    container VARCHAR(256) NOT NULL,
-    UNIQUE (meta_id, conf_id, context, container)
+    id        UUID NOT NULL DEFAULT uuid_generate_v4() PRIMARY KEY,
+    conf_id   INTEGER NOT NULL REFERENCES podscaler.conf (id),
+    context   TEXT NOT NULL,
+    container TEXT NOT NULL,
+    UNIQUE (conf_id, context, container)
+);
+
+CREATE TABLE IF NOT EXISTS podscaler.raw_prowjobs
+(
+    id        UUID NOT NULL DEFAULT uuid_generate_v4() PRIMARY KEY,
+    job       TEXT NOT NULL,
+    container TEXT NOT NULL,
+    UNIQUE (job, container)
 );
 
 CREATE TABLE IF NOT EXISTS podscaler.histograms
 (
-    id        SERIAL PRIMARY KEY,
-    meta_id   INTEGER NOT NULL,
-    FOREIGN KEY (meta_id) REFERENCES podscaler.meta (id),
+    hist_id   SERIAL PRIMARY KEY,
+    id        UUID NOT NULL,
     added     TIMESTAMP DEFAULT CURRENT_TIMESTAMP NOT NULL,
-    metric    VARCHAR(256) NOT NULL,
+    metric    TEXT NOT NULL,
     histogram BYTEA NOT NULL
 );

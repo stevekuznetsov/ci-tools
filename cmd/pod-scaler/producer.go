@@ -1,11 +1,11 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
 	"sort"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -139,45 +139,58 @@ func produce(clients map[string]prometheusapi.API, dataCache cache, sqlClient *p
 	}, 3*time.Hour)
 }
 
+type typedColumn struct {
+	name     string
+	dataType string
+}
+
 // upsertReturningId creates a query for cases where we want to insert a new row or use a previous one,
 // in an atomic manner. Postgres does not allow `INSERT ... ON CONFLICT DO NOTHING RETURNING ...` to work,
 // so we need this monstrosity in order to be performant, as we expect most of these calls to be duplicates
 // of what's already in the DB: https://stackoverflow.com/a/42217872
-func upsertReturningId(table string, columns ...string) string {
-	delimitedColumns := strings.Join(columns, ", ")
+func upsertReturningId(table string, columns ...typedColumn) string {
+	var columnNames []string
 	var parameters []string
-	for i := range columns {
-		parameters = append(parameters, fmt.Sprintf("$%d", i+1))
+	for i, column := range columns {
+		columnNames = append(columnNames, column.name)
+		parameters = append(parameters, fmt.Sprintf("$%d::%s", i+1, column.dataType))
 	}
+	delimitedColumns := strings.Join(columnNames, ", ")
 	delimitedParameters := strings.Join(parameters, ", ")
 	return fmt.Sprintf(`WITH input_rows(%[1]s) AS (
-    (SELECT %[1]s FROM %[2]s LIMIT 0)
+    (SELECT %[1]s FROM podscaler.%[2]s LIMIT 0)
     UNION ALL
     VALUES (%[3]s)
-), inserted_rows AS (INSERT INTO %[2]s(%[1]s)
+), inserted_rows AS (INSERT INTO podscaler.%[2]s(%[1]s)
     SELECT * FROM input_rows
     ON CONFLICT DO NOTHING
     RETURNING id
 )
 SELECT id FROM inserted_rows
 UNION ALL
-SELECT c.id FROM input_rows JOIN %[2]s c USING(%[1]s)`, delimitedColumns, table, delimitedParameters)
+SELECT c.id FROM input_rows JOIN podscaler.%[2]s c USING(%[1]s)`, delimitedColumns, table, delimitedParameters)
 }
 
 func storeData(name, query string, cache *CachedQuery, logger *logrus.Entry, client *pgxpool.Pool) error {
 	for cluster, ranges := range cache.RangesByCluster {
 		logger.Infof("Saving %s:%s", name, cluster)
 		var queryId int64
-		if err := client.QueryRow(interrupts.Context(), upsertReturningId("poscaler.queries", "cluster", "query"), cluster, query).Scan(&queryId); err != nil {
-			return fmt.Errorf("could not get query identifier: %v", err)
+		if err := client.QueryRow(interrupts.Context(), upsertReturningId("queries", typedColumn{
+			name:     "cluster",
+			dataType: "text",
+		}, typedColumn{
+			name:     "query",
+			dataType: "text",
+		}), cluster, query).Scan(&queryId); err != nil {
+			return fmt.Errorf("could not get query identifier: %w", err)
 		}
 
 		if out, err := client.Exec(interrupts.Context(), `DELETE FROM podscaler.ranges WHERE id=$1`, queryId); err != nil {
-			return fmt.Errorf("could not remove old ranges: %v: %s", err, string(out))
+			return fmt.Errorf("could not remove old ranges: %w: %s", err, string(out))
 		}
 		for _, r := range ranges {
 			if out, err := client.Exec(interrupts.Context(), `INSERT INTO podscaler.ranges(id, query_start, query_end) VALUES($1, $2, $3)`, queryId, r.Start, r.End); err != nil {
-				return fmt.Errorf("could not record range: %v: %s", err, string(out))
+				return fmt.Errorf("could not record range: %w: %s", err, string(out))
 			}
 		}
 	}
@@ -185,16 +198,87 @@ func storeData(name, query string, cache *CachedQuery, logger *logrus.Entry, cli
 	prefix, metric := parts[0], parts[1]
 	for meta, identifiers := range cache.DataByMetaData {
 		var confId int64
-		if err := client.QueryRow(interrupts.Context(), upsertReturningId("poscaler.conf", "org", "repo", "branch", "variant"), meta.Org, meta.Repo, meta.Branch, meta.Variant).Scan(&confId); err != nil {
-			return fmt.Errorf("could not get configuration identifier: %v", err)
+		if meta.Org != "" {
+			if err := client.QueryRow(interrupts.Context(), upsertReturningId("conf", typedColumn{
+				name:     "org",
+				dataType: "text",
+			}, typedColumn{
+				name:     "repo",
+				dataType: "text",
+			}, typedColumn{
+				name:     "branch",
+				dataType: "text",
+			}, typedColumn{
+				name:     "variant",
+				dataType: "text",
+			}), meta.Org, meta.Repo, meta.Branch, meta.Variant).Scan(&confId); err != nil {
+				return fmt.Errorf("could not get configuration identifier: %w", err)
+			}
 		}
+		var metaId string
+		var table string
+		var columns []typedColumn
+		var args []interface{}
 		switch prefix {
 		case "pods":
-
+			if confId == 0 {
+				logrus.Warnf("meta %v doesn't match any config, but should", meta)
+				continue
+			}
+			if strings.HasSuffix(meta.Pod, "-build") {
+				build := strings.TrimSuffix(meta.Pod, "-build")
+				table = "builds"
+				columns = []typedColumn{{name: "conf_id", dataType: "integer"}, {name: "build", dataType: "text"}, {name: "container", dataType: "text"}}
+				args = []interface{}{confId, build, meta.Container}
+			} else if strings.HasPrefix(meta.Pod, "release-") {
+				table = "releases"
+				columns = []typedColumn{{name: "conf_id", dataType: "integer"}, {name: "pod", dataType: "text"}, {name: "container", dataType: "text"}}
+				args = []interface{}{confId, meta.Pod, meta.Container}
+			} else if meta.Target != "" {
+				table = "pods"
+				columns = []typedColumn{{name: "conf_id", dataType: "integer"}, {name: "target", dataType: "text"}, {name: "container", dataType: "text"}}
+				args = []interface{}{confId, meta.Target, meta.Container}
+			} else if meta.Container == "rpm-repo" {
+				table = "rpms"
+				columns = []typedColumn{{name: "conf_id", dataType: "integer"}}
+				args = []interface{}{confId}
+			} else {
+				logger.Fatalf("didn't handle meta: %v", meta)
+			}
 		case "steps":
-
+			if confId == 0 {
+				logrus.Warnf("meta %v doesn't match any config, but should", meta)
+				continue
+			}
+			table = "steps"
+			columns = []typedColumn{{name: "conf_id", dataType: "integer"}, {name: "target", dataType: "text"}, {name: "step", dataType: "text"}, {name: "container", dataType: "text"}}
+			args = []interface{}{confId, meta.Target, meta.Step, meta.Container}
 		case "prowjobs":
-			// sdf
+			if meta.Org != "" {
+				if confId == 0 {
+					logrus.Warnf("meta %v doesn't match any config, but should", meta)
+					continue
+				}
+				table = "prowjobs"
+				columns = []typedColumn{{name: "conf_id", dataType: "integer"}, {name: "context", dataType: "text"}, {name: "container", dataType: "text"}}
+				args = []interface{}{confId, meta.Target, meta.Container}
+			} else {
+				table = "raw_prowjobs"
+				columns = []typedColumn{{name: "job", dataType: "text"}, {name: "container", dataType: "text"}}
+				args = []interface{}{meta.Target, meta.Container}
+			}
+		}
+		if err := client.QueryRow(interrupts.Context(), upsertReturningId(table, columns...), args...).Scan(&metaId); err != nil {
+			return fmt.Errorf("could not get meta identifier: %w", err)
+		}
+		for _, identifier := range identifiers {
+			serializedHist := bytes.Buffer{}
+			if err := cache.Data[identifier].Serialize(&serializedHist); err != nil {
+				return fmt.Errorf("could not serialize hist: %w", err)
+			}
+			if out, err := client.Exec(interrupts.Context(), `INSERT INTO podscaler.histograms(id, metric, histogram) VALUES($1, $2, $3)`, metaId, metric, serializedHist.Bytes()); err != nil {
+				return fmt.Errorf("could not record range: %w: %s", err, string(out))
+			}
 		}
 	}
 	return nil

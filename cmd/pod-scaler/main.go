@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"cloud.google.com/go/storage"
+	"github.com/jackc/pgx/v4"
 	"github.com/jackc/pgx/v4/log/logrusadapter"
 	"github.com/jackc/pgx/v4/pgxpool"
 	"github.com/openshift/ci-tools/pkg/psql"
@@ -189,6 +190,7 @@ func main() {
 		logrus.WithError(err).Fatal("Could not create SQL client connection config.")
 	}
 	connConfig.ConnConfig.Logger = logrusadapter.NewLogger(logrus.WithField("client", "postgres"))
+	connConfig.ConnConfig.LogLevel = pgx.LogLevelWarn
 
 	pool, err := pgxpool.ConnectConfig(interrupts.Context(), connConfig)
 	if err != nil {
