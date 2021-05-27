@@ -12,8 +12,9 @@ CREATE TABLE IF NOT EXISTS podscaler.queries
 
 CREATE TABLE IF NOT EXISTS podscaler.ranges
 (
-    id          INTEGER NOT NULL PRIMARY KEY,
-    FOREIGN KEY (id) REFERENCES podscaler.queries (id),
+    id       SERIAL PRIMARY KEY,
+    query_id INTEGER NOT NULL,
+    FOREIGN KEY (query_id) REFERENCES podscaler.queries (id),
     query_start TIMESTAMP NOT NULL,
     query_end   TIMESTAMP NOT NULL
 );
@@ -91,7 +92,7 @@ CREATE TABLE IF NOT EXISTS podscaler.raw_prowjobs
 
 CREATE TABLE IF NOT EXISTS podscaler.histograms
 (
-    hist_id   SERIAL PRIMARY KEY,
+    hist_id   NUMERIC NOT NULL PRIMARY KEY,
     id        UUID NOT NULL,
     added     TIMESTAMP DEFAULT CURRENT_TIMESTAMP NOT NULL,
     metric    TEXT NOT NULL,

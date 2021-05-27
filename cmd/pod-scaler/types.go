@@ -42,6 +42,8 @@ const (
 type CachedQuery struct {
 	// Query is the query we executed against Prometheus to get this data.
 	Query string `json:"query"`
+	// Metric is the metric we queried Prometheus for to get this data.
+	Metric string `json:"metric"`
 	// RangesByCluster stores time ranges for which we've succeeded in getting this
 	// data fromm Prometheus servers on the clusters we're querying.
 	RangesByCluster map[string][]TimeRange `json:"ranges_by_cluster"`

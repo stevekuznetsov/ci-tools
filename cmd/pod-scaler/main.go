@@ -201,6 +201,31 @@ func main() {
 		logrus.WithError(err).Fatal("Could not ping SQL server.")
 	}
 
+	out, err := pool.Exec(interrupts.Context(), initSQL)
+	if err != nil {
+		logrus.WithError(err).Fatalf("Could not initialize SQL database: %v.", string(out))
+	}
+
+	columnTypesByTable := map[string]map[string]string{}
+	insert := func(table, column, dataType string) {
+		if _, exists := columnTypesByTable[table]; !exists {
+			columnTypesByTable[table] = map[string]string{}
+		}
+		columnTypesByTable[table][column] = dataType
+	}
+	var table, column, dataType string
+	if _, err := pool.QueryFunc(interrupts.Context(), `SELECT table_name, column_name, data_type FROM information_schema.columns WHERE table_schema = 'podscaler';`, []interface{}{}, []interface{}{&table, &column, &dataType}, func(row pgx.QueryFuncRow) error {
+		insert(table, column, dataType)
+		return nil
+	}); err != nil {
+		logrus.WithError(err).Fatal("Failed to initialize column data type cache.")
+	}
+
+	poolWithCache := &poolWithCache{
+		Pool:               pool,
+		columnTypesByTable: columnTypesByTable,
+	}
+
 	var cache cache
 	if opts.cacheDir != "" {
 		cache = &localCache{dir: opts.cacheDir}
@@ -215,7 +240,7 @@ func main() {
 
 	switch opts.mode {
 	case "producer":
-		mainProduce(opts, cache, pool)
+		mainProduce(opts, cache, poolWithCache)
 	case "consumer.ui":
 		// TODO
 	case "consumer.admission":
@@ -224,12 +249,7 @@ func main() {
 	interrupts.WaitForGracefulShutdown()
 }
 
-func mainProduce(opts *options, cache cache, sqlClient *pgxpool.Pool) {
-	out, err := sqlClient.Exec(interrupts.Context(), initSQL)
-	if err != nil {
-		logrus.WithError(err).Fatalf("Could not initialize SQL database: %v.", string(out))
-	}
-
+func mainProduce(opts *options, cache cache, sqlClient *poolWithCache) {
 	kubeconfigChangedCallBack := func(e fsnotify.Event) {
 		logrus.WithField("event", e.String()).Fatal("Kubeconfig changed, exiting to get restarted by Kubelet and pick up the changes")
 	}
@@ -250,15 +270,21 @@ func mainProduce(opts *options, cache cache, sqlClient *pgxpool.Pool) {
 		if err != nil {
 			logger.WithError(err).Fatal("Failed to get Prometheus route.")
 		}
+		var addr string
+		if route.Spec.TLS != nil {
+			addr = "https://" + route.Spec.Host
+		} else {
+			addr = "http://" + route.Spec.Host
+		}
 		promClient, err := prometheusclient.NewClient(prometheusclient.Config{
-			Address:      "https://" + route.Spec.Host,
+			Address:      addr,
 			RoundTripper: transport.NewBearerAuthRoundTripper(config.BearerToken, prometheusclient.DefaultRoundTripper),
 		})
 		if err != nil {
 			logger.WithError(err).Fatal("Failed to get Prometheus client.")
 		}
 		clients[cluster] = prometheusapi.NewAPI(promClient)
-		logger.Debugf("Loaded Prometheus client.")
+		logger.WithField("host", route.Spec.Host).Debugf("Loaded Prometheus client.")
 	}
 
 	go produce(clients, cache, sqlClient)

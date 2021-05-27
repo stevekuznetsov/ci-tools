@@ -268,3 +268,17 @@ $(TMPDIR)/boskos:
 	mv $(TMPDIR)/image/app $(TMPDIR)/boskos
 	chmod +x $(TMPDIR)/boskos
 	rm -rf $(TMPDIR)/image
+
+$(TMPDIR)/prometheus:
+	mkdir -p $(TMPDIR)/image
+	oc image extract quay.io/prometheus/prometheus:latest --path /bin/prometheus:$(TMPDIR)/image
+	mv $(TMPDIR)/image/prometheus $(TMPDIR)/prometheus
+	chmod +x $(TMPDIR)/prometheus
+	rm -rf $(TMPDIR)/image
+
+$(TMPDIR)/promtool:
+	mkdir -p $(TMPDIR)/image
+	oc image extract quay.io/prometheus/prometheus:latest --path /bin/promtool:$(TMPDIR)/image
+	mv $(TMPDIR)/image/promtool $(TMPDIR)/promtool
+	chmod +x $(TMPDIR)/promtool
+	rm -rf $(TMPDIR)/image

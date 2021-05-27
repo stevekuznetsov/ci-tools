@@ -5,13 +5,16 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"sort"
 	"strings"
 	"sync"
 	"time"
 
 	"cloud.google.com/go/storage"
-	"github.com/jackc/pgx/v4/pgxpool"
+	"github.com/jackc/pgconn"
+	"github.com/jackc/pgtype"
+	"github.com/jackc/pgx/v4"
 	"github.com/openhistogram/circonusllhist"
 	prometheusapi "github.com/prometheus/client_golang/api/prometheus/v1"
 	"github.com/prometheus/common/model"
@@ -43,50 +46,52 @@ const (
 func queriesByMetric() map[string]string {
 	queries := map[string]string{}
 	for _, info := range []struct {
-		prefix   string
-		selector string
-		labels   []string
+		queryType queryType
+		selector  string
+		labels    []string
 	}{
 		{
-			prefix:   "prowjobs",
-			selector: `{` + string(ProwLabelNameCreated) + `="true",` + string(ProwLabelNameJob) + `!="",` + string(LabelNameRehearsal) + `=""}`,
-			labels:   []string{string(ProwLabelNameCreated), string(ProwLabelNameContext), string(ProwLabelNameOrg), string(ProwLabelNameRepo), string(ProwLabelNameBranch), string(ProwLabelNameJob), string(ProwLabelNameType)},
+			queryType: queryTypeProwJobs,
+			selector:  `{` + string(ProwLabelNameCreated) + `="true",` + string(ProwLabelNameJob) + `!="",` + string(LabelNameRehearsal) + `=""}`,
+			labels:    []string{string(ProwLabelNameCreated), string(ProwLabelNameContext), string(ProwLabelNameOrg), string(ProwLabelNameRepo), string(ProwLabelNameBranch), string(ProwLabelNameJob), string(ProwLabelNameType)},
 		},
 		{
-			prefix:   "pods",
-			selector: `{` + string(LabelNameCreated) + `="true",` + string(LabelNameStep) + `=""}`,
-			labels:   []string{string(LabelNameOrg), string(LabelNameRepo), string(LabelNameBranch), string(LabelNameVariant), string(LabelNameTarget), string(LabelNameBuild), string(LabelNameRelease), string(LabelNameApp)},
+			queryType: queryTypePods,
+			selector:  `{` + string(LabelNameCreated) + `="true",` + string(LabelNameStep) + `=""}`,
+			labels:    []string{string(LabelNameOrg), string(LabelNameRepo), string(LabelNameBranch), string(LabelNameVariant), string(LabelNameTarget), string(LabelNameBuild), string(LabelNameRelease), string(LabelNameApp)},
 		},
 		{
-			prefix:   "steps",
-			selector: `{` + string(LabelNameCreated) + `="true",` + string(LabelNameStep) + `!=""}`,
-			labels:   []string{string(LabelNameOrg), string(LabelNameRepo), string(LabelNameBranch), string(LabelNameVariant), string(LabelNameTarget), string(LabelNameStep)},
+			queryType: queryTypeSteps,
+			selector:  `{` + string(LabelNameCreated) + `="true",` + string(LabelNameStep) + `!=""}`,
+			labels:    []string{string(LabelNameOrg), string(LabelNameRepo), string(LabelNameBranch), string(LabelNameVariant), string(LabelNameTarget), string(LabelNameStep)},
 		},
 	} {
 		for name, metric := range map[string]string{
 			MetricNameCPUUsage:         `rate(` + MetricNameCPUUsage + containerFilter + `[3m])`,
 			MetricNameMemoryWorkingSet: MetricNameMemoryWorkingSet + containerFilter,
 		} {
-			queries[fmt.Sprintf("%s/%s", info.prefix, name)] = queryFor(metric, info.selector, info.labels)
+			queries[fmt.Sprintf("%s/%s", info.queryType, name)] = queryFor(metric, info.selector, info.labels)
 		}
 	}
 	return queries
 }
 
-func produce(clients map[string]prometheusapi.API, dataCache cache, sqlClient *pgxpool.Pool) {
+func produce(clients map[string]prometheusapi.API, dataCache cache, sqlClient *poolWithCache) {
 	interrupts.TickLiteral(func() {
 		for name, query := range queriesByMetric() {
 			name := name
 			query := query
 			logger := logrus.WithField("metric", name)
 			cache, err := loadCache(dataCache, name, logger)
-			if errors.Is(err, storage.ErrObjectNotExist) {
+			if errors.Is(err, storage.ErrObjectNotExist) || errors.Is(err, os.ErrNotExist) {
 				ranges := map[string][]TimeRange{}
 				for cluster := range clients {
 					ranges[cluster] = []TimeRange{}
 				}
+				parts := strings.SplitN(name, "/", 2)
 				cache = &CachedQuery{
 					Query:           query,
+					Metric:          parts[1],
 					RangesByCluster: ranges,
 					Data:            map[model.Fingerprint]*circonusllhist.Histogram{},
 					DataByMetaData:  map[FullMetadata][]model.Fingerprint{},
@@ -94,47 +99,49 @@ func produce(clients map[string]prometheusapi.API, dataCache cache, sqlClient *p
 			} else if err != nil {
 				logrus.WithError(err).Fatal("Could not load data from storage.")
 			}
-			//now := time.Now()
-			//q := querier{
-			//	lock: &sync.RWMutex{},
-			//	data: cache,
-			//}
-			//wg := &sync.WaitGroup{}
-			//for clusterName, client := range clients {
-			//	metadata := &clusterMetadata{
-			//		logger: logger.WithField("cluster", clusterName),
-			//		name:   clusterName,
-			//		client: client,
-			//		lock:   &sync.RWMutex{},
-			//		// there's absolutely no chance Prometheus at the current scaling will ever be able
-			//		// to respond to large requests it's completely capable of creating, so don't even
-			//		// bother asking for anything larger than 1/20th of the largest request we can get
-			//		// responses within the default client connection timeout.
-			//		maxSize: MaxSamplesPerRequest / 20,
-			//		errors:  make(chan error),
-			//		// there's also no chance that Prometheus will be able to handle any real concurrent
-			//		// request volume, so don't even bother trying to request more samples at once than
-			//		// a fifth of the maximum samples it can technically provide in one request
-			//		sync: semaphore.NewWeighted(MaxSamplesPerRequest / 15),
-			//		wg:   &sync.WaitGroup{},
-			//	}
-			//	wg.Add(1)
-			//	go func() {
-			//		defer wg.Done()
-			//		if err := q.execute(interrupts.Context(), metadata, now); err != nil {
-			//			metadata.logger.WithError(err).Error("Failed to query Prometheus.")
-			//		}
-			//	}()
-			//}
-			//go func() { // don't associate this with the context as we want to flush when interrupted
-			//	wg.Wait()
-			//	if err := storeCache(dataCache, name, cache, logger); err != nil {
-			//		logger.WithError(err).Error("Failed to write cached data.")
-			//	}
-			//}()
-			if err := storeData(name, query, cache, logger, sqlClient); err != nil {
-				logger.WithError(err).Error("Failed to write cached data to SQL.")
+			now := time.Now()
+			q := querier{
+				lock:      &sync.RWMutex{},
+				data:      cache,
+				sqlClient: sqlClient,
 			}
+			wg := &sync.WaitGroup{}
+			for clusterName, client := range clients {
+				metadata := &clusterMetadata{
+					logger: logger.WithField("cluster", clusterName),
+					name:   clusterName,
+					client: client,
+					lock:   &sync.RWMutex{},
+					// there's absolutely no chance Prometheus at the current scaling will ever be able
+					// to respond to large requests it's completely capable of creating, so don't even
+					// bother asking for anything larger than 1/20th of the largest request we can get
+					// responses within the default client connection timeout.
+					maxSize: MaxSamplesPerRequest / 20,
+					errors:  make(chan error),
+					// there's also no chance that Prometheus will be able to handle any real concurrent
+					// request volume, so don't even bother trying to request more samples at once than
+					// a fifth of the maximum samples it can technically provide in one request
+					sync: semaphore.NewWeighted(MaxSamplesPerRequest / 15),
+					wg:   &sync.WaitGroup{},
+				}
+				wg.Add(1)
+				go func() {
+					defer wg.Done()
+					if err := q.execute(interrupts.Context(), metadata, now); err != nil {
+						metadata.logger.WithError(err).Error("Failed to query Prometheus.")
+					}
+				}()
+			}
+			go func() { // don't associate this with the context as we want to flush when interrupted
+				wg.Wait()
+				logger.Infof("Found %d histograms.", len(cache.Data))
+				if err := storeCache(dataCache, name, cache, logger); err != nil {
+					logger.WithError(err).Error("Failed to write cached data.")
+				}
+				if err := storeData(name, query, cache, logger, sqlClient); err != nil {
+					logger.WithError(err).Error("Failed to write cached data to SQL.")
+				}
+			}()
 		}
 	}, 3*time.Hour)
 }
@@ -158,7 +165,7 @@ func upsertReturningId(table string, columns ...typedColumn) string {
 	delimitedColumns := strings.Join(columnNames, ", ")
 	delimitedParameters := strings.Join(parameters, ", ")
 	return fmt.Sprintf(`WITH input_rows(%[1]s) AS (
-    (SELECT %[1]s FROM podscaler.%[2]s LIMIT 0)
+    (SELECT %[1]s FROM podscaler.%[2]s LIMIT 0)	
     UNION ALL
     VALUES (%[3]s)
 ), inserted_rows AS (INSERT INTO podscaler.%[2]s(%[1]s)
@@ -171,9 +178,10 @@ UNION ALL
 SELECT c.id FROM input_rows JOIN podscaler.%[2]s c USING(%[1]s)`, delimitedColumns, table, delimitedParameters)
 }
 
-func storeData(name, query string, cache *CachedQuery, logger *logrus.Entry, client *pgxpool.Pool) error {
+func storeData(name, query string, cache *CachedQuery, logger *logrus.Entry, client *poolWithCache) error {
+	flushStart := time.Now()
+	logger.Info("Flushing Prometheus data to database.")
 	for cluster, ranges := range cache.RangesByCluster {
-		logger.Infof("Saving %s:%s", name, cluster)
 		var queryId int64
 		if err := client.QueryRow(interrupts.Context(), upsertReturningId("queries", typedColumn{
 			name:     "cluster",
@@ -185,11 +193,11 @@ func storeData(name, query string, cache *CachedQuery, logger *logrus.Entry, cli
 			return fmt.Errorf("could not get query identifier: %w", err)
 		}
 
-		if out, err := client.Exec(interrupts.Context(), `DELETE FROM podscaler.ranges WHERE id=$1`, queryId); err != nil {
+		if out, err := client.Exec(interrupts.Context(), `DELETE FROM podscaler.ranges WHERE query_id=$1`, queryId); err != nil {
 			return fmt.Errorf("could not remove old ranges: %w: %s", err, string(out))
 		}
 		for _, r := range ranges {
-			if out, err := client.Exec(interrupts.Context(), `INSERT INTO podscaler.ranges(id, query_start, query_end) VALUES($1, $2, $3)`, queryId, r.Start, r.End); err != nil {
+			if out, err := client.Exec(interrupts.Context(), `INSERT INTO podscaler.ranges(query_id, query_start, query_end) VALUES($1, $2, $3)`, queryId, r.Start, r.End); err != nil {
 				return fmt.Errorf("could not record range: %w: %s", err, string(out))
 			}
 		}
@@ -276,11 +284,16 @@ func storeData(name, query string, cache *CachedQuery, logger *logrus.Entry, cli
 			if err := cache.Data[identifier].Serialize(&serializedHist); err != nil {
 				return fmt.Errorf("could not serialize hist: %w", err)
 			}
-			if out, err := client.Exec(interrupts.Context(), `INSERT INTO podscaler.histograms(id, metric, histogram) VALUES($1, $2, $3)`, metaId, metric, serializedHist.Bytes()); err != nil {
+			serializedHistBytea := pgtype.Bytea{
+				Bytes:  serializedHist.Bytes(),
+				Status: pgtype.Present,
+			}
+			if out, err := client.Exec(interrupts.Context(), `INSERT INTO podscaler.histograms(hist_id, id, metric, histogram) VALUES($1, $2, $3, $4) ON CONFLICT DO NOTHING`, identifier, metaId, metric, &serializedHistBytea); err != nil {
 				return fmt.Errorf("could not record range: %w: %s", err, string(out))
 			}
 		}
 	}
+	logger.Infof("Flushed Prometheus data to database after %s.", time.Since(flushStart).Round(time.Second))
 	return nil
 }
 
@@ -311,7 +324,17 @@ func rangeFrom(r prometheusapi.Range) TimeRange {
 type querier struct {
 	lock *sync.RWMutex
 	data *CachedQuery
+
+	sqlClient *poolWithCache
 }
+
+type queryType string
+
+const (
+	queryTypePods     queryType = "pods"
+	queryTypeSteps    queryType = "steps"
+	queryTypeProwJobs queryType = "prowjobs"
+)
 
 type clusterMetadata struct {
 	logger *logrus.Entry
@@ -471,9 +494,118 @@ func (q *querier) executeOverRange(ctx context.Context, c *clusterMetadata, r pr
 	saveStart := time.Now()
 	logger.Debug("Saving response from Prometheus data.")
 	q.lock.Lock()
+	q.record(c.name, rangeFrom(r), matrix, logger)
 	q.data.record(c.name, rangeFrom(r), matrix, logger)
 	q.lock.Unlock()
 	logger.Debugf("Saved Prometheus response after %s.", time.Since(saveStart).Round(time.Second))
+}
+
+// record will record the data from Prometheus for this time range to the database. As we're using
+// the Serializable isolation level, our transactions can fail if they race with some other concurrent
+// write, so we just retry.
+func (q *querier) record(clusterName string, r TimeRange, matrix model.Matrix, logger *logrus.Entry) {
+	for {
+		pgErr := &pgconn.PgError{}
+		if err := q.tryRecord(clusterName, r, matrix, logger); errors.As(err, &pgErr) && pgErr.Code == "40001" {
+			// this was a serialization error, retry
+			logger.Debug("Retrying commit after serialization error.")
+			continue
+		} else if err != nil {
+			logger.WithError(err).Warn("Could not commit data to database.")
+		}
+		break
+	}
+}
+
+// tryRecord attempts to record the data from Prometheus for this time range to the database
+func (q *querier) tryRecord(clusterName string, r TimeRange, matrix model.Matrix, logger *logrus.Entry) error {
+	txn, err := q.sqlClient.BeginTx(interrupts.Context(), pgx.TxOptions{
+		IsoLevel:       pgx.Serializable,
+		AccessMode:     pgx.ReadWrite,
+		DeferrableMode: pgx.NotDeferrable,
+	})
+	if err != nil {
+		return fmt.Errorf("could not begin transaction: %w", err)
+	}
+
+	identifier := identifier{
+		delegate:           txn,
+		columnTypesByTable: q.sqlClient.columnTypesByTable,
+	}
+
+	// first, update the query records to show that we've successfully gotten data from this time range
+	queryId, err := identifier.forQuery(clusterName, q.data.Query)
+	if err != nil {
+		return fmt.Errorf("could not get query identifier: %w", err)
+	}
+
+	var ranges []TimeRange
+	var start, end time.Time
+	if _, err := txn.QueryFunc(interrupts.Context(), `SELECT query_start, query_end FROM podscaler.ranges WHERE query_id=$1`, []interface{}{queryId}, []interface{}{&start, &end}, func(row pgx.QueryFuncRow) error {
+		ranges = append(ranges, TimeRange{Start: *(&start), End: *(&end)})
+		return nil
+	}); err != nil {
+		return fmt.Errorf("could not query old ranges: %w", err)
+	}
+	ranges = coalesce(append(ranges, r))
+
+	if out, err := txn.Exec(interrupts.Context(), `DELETE FROM podscaler.ranges WHERE query_id=$1`, queryId); err != nil {
+		return fmt.Errorf("could not remove old ranges: %w: %s", err, string(out))
+	}
+	for _, r := range ranges {
+		if out, err := txn.Exec(interrupts.Context(), `INSERT INTO podscaler.ranges(query_id, query_start, query_end) VALUES($1, $2, $3)`, queryId, r.Start, r.End); err != nil {
+			return fmt.Errorf("could not record range: %w: %s", err, string(out))
+		}
+	}
+
+	// then, update the actual data for each histogram
+	for _, stream := range matrix {
+		metricId, err := identifier.forMetric(stream.Metric)
+		if err != nil {
+			return fmt.Errorf("could not get metric identifier: %w", err)
+		}
+		// Metrics are unique in our dataset, so if we've already seen this metric/fingerprint,
+		// we're guaranteed to already have recorded it in the indices, and we just need to add
+		// the new data. This case will occur if one metric/fingerprint shows up in more than
+		// one query range.
+		fingerprint := stream.Metric.Fingerprint()
+		var hist *circonusllhist.Histogram
+		var data pgtype.Bytea
+		if err := txn.QueryRow(interrupts.Context(), `SELECT histogram FROM podscaler.histograms WHERE hist_id=$1 AND id=$2 AND metric=$3;`, fingerprint, metricId, q.data.Metric).Scan(&data); err != nil {
+			pgErr := &pgconn.PgError{}
+			if errors.As(err, &pgErr) && pgErr.Code == "02000" || err == pgx.ErrNoRows {
+				// there's no previous record
+				hist = circonusllhist.New()
+			} else {
+				return fmt.Errorf("could not fetch histogram data from database: %w", err)
+			}
+		} else {
+			h, err := circonusllhist.Deserialize(bytes.NewBuffer(data.Bytes))
+			if err != nil {
+				return fmt.Errorf("could not deserialize histogram data from database: %w", err)
+			}
+			hist = h
+		}
+		for _, value := range stream.Values {
+			err := hist.RecordValue(float64(value.Value))
+			if err != nil {
+				return fmt.Errorf("failed to insert data into histogram: %w", err)
+			}
+		}
+		serializedHist := &bytes.Buffer{}
+		if err := hist.Serialize(serializedHist); err != nil {
+			return fmt.Errorf("failed to serialize histogram: %w", err)
+		}
+		serializedHistBytea := pgtype.Bytea{
+			Bytes:  serializedHist.Bytes(),
+			Status: pgtype.Present,
+		}
+		if _, err := txn.Exec(interrupts.Context(), `INSERT INTO podscaler.histograms(hist_id,id,metric,histogram) VALUES($1,$2,$3,$4)
+ON CONFLICT(hist_id) DO UPDATE SET histogram=$4;`, fingerprint, metricId, q.data.Metric, &serializedHistBytea); err != nil {
+			return fmt.Errorf("failed to upsert histogram data into database: %w", err)
+		}
+	}
+	return txn.Commit(interrupts.Context())
 }
 
 // record adds the data in the matrix to the cache and records that the given cluster has
@@ -604,10 +736,6 @@ func syntheticContextFromJob(meta api.Metadata, metric model.Metric) string {
 	if !typeLabeled {
 		// this should not happen, but if it does, we can't deduce a job name
 		return ""
-	}
-	if prowv1.ProwJobType(jobType) == prowv1.PeriodicJob && meta.Repo == "" {
-		// this periodic has no repo associated with it, no use to strip any prefix
-		return string(job)
 	}
 	var prefix string
 	switch prowv1.ProwJobType(jobType) {
